@@ -1,0 +1,219 @@
+data merged_county_final;
+    set merged_county_final;
+
+    array proc{5} $ hbrchcp1-hbrchcp5;
+    array diag{5} $ hbdiag1-hbdiag5;
+
+    preventive = 0;
+    well_visit = 0;
+
+    do i = 1 to 5;
+
+        /* ---- general care procedure codes ---- */
+        if proc{i} in ("M1069","G0402","G0403","G0404","G0405","G0438","G0439","G0468",
+                       "G2211","G0136","99387","99397","99497","99498","G0446","G0447","G0473",
+                       "97802","97803","97804","G0270","G0271","G9871","G9886","G9887",
+                       "G0513","G0514")
+            then preventive = 1;
+
+        if "99401" <= proc{i} <= "99429" then preventive = 1;   /* counseling/risk-factor codes */
+
+        /* ---- screenings ---- */
+        if proc{i} in ("G0442","G0443","99406","99407","99408","99409","G0444","80061",
+                       "G0117","G0118","G0499","G0472","G0567","G0432","G0433","G0435","G0475",
+                       "77063","77067","G0102","G0103","G0476","G0123","G0124","G0141","G0143",
+                       "G0144","G0145","G0147","G0148","P3000","P3001","Q0091","G0101")
+            then preventive = 1;
+
+        if proc{i} = "G0296" and 50 <= hkage <= 80 then preventive = 1;
+        if proc{i} = "71271" and 50 <= hkage <= 80 then preventive = 1;
+
+        /* ---- diabetes screening -- only for beneficiaries without diabetes history ---- */
+        if proc{i} in ("82947","82950","82951","83036") 
+            and hkc_diab_yr_v2 in ("0","2") then preventive = 1;
+
+        /* ---- female-specific bone-density related codes, age > 65 ---- */
+        if proc{i} in ("76977","77078","77080","77081","77085","G0130") 
+            and hkage > 65 and hksex = 2 then preventive = 1;
+
+        /* ---- colon cancer screening: requires prev_proc_modifier = 1 (modifier "33" present on the claim), age < 85 ---- */
+        if proc{i} in ("45378","45379","45380","45381","45384","45385","45386",
+                       "45388","45389","45390","45391","45392","45393","45398")
+            and prev_proc_modifier = 1 and hkage < 85 then preventive = 1;
+
+        if proc{i} in ("G0104","G0105","G0121","G0106","G0120","G0122","G0327") 
+            and hkage < 85 then preventive = 1;
+
+        /* ---- FOBT, age < 85 ---- */
+        if proc{i} in ("81528","82270","82272","82274","G0464","G0107","G0327","G0328") 
+            and hkage < 85 then preventive = 1;
+
+        /* ---- other colorectal screening codes, age < 85 ---- */
+        if proc{i} in ("00812","74263","0464U","0537U") and hkage < 85 then preventive = 1;
+
+        /* ---- immunizations ---- */
+        if proc{i} in ("90480","91304","91319","91320","91321","91322","91323",
+                       "G0008","M0201","Q2039","90653","90656","90657","90658","90660",
+                       "90661","90662","90673","G0010","90739","90740","90743","90744",
+                       "90746","90747","90759","G0009","90670","90671","90677","90684","90732")
+            then preventive = 1;
+
+        /* ---- diagnosis codes: general care ---- */
+        if substr(diag{i},1,4) in ("Z000","Z008") then preventive = 1;
+        if substr(diag{i},1,5) in ("Z0100","Z0101") then preventive = 1;
+        if substr(diag{i},1,5) in ("Z0110","Z0111") then preventive = 1;
+        if substr(diag{i},1,4) = "Z012" then preventive = 1;
+        if substr(diag{i},1,4) = "Z013" then preventive = 1;
+        if substr(diag{i},1,4) = "Z014" then preventive = 1;
+
+        /* ---- diagnosis codes: immunizations ---- */
+        if substr(diag{i},1,3) = "Z23" then preventive = 1;
+
+        /* ============ well_visit: general/wellness/AWV codes only ============ */
+        if proc{i} in ("G0402","G0403","G0404","G0405","G0438","G0439","G0468",
+                       "G2211","G0136","99387","99397","99497","99498","G0513","G0514")
+            then well_visit = 1;
+
+        if substr(diag{i},1,4) in ("Z000","Z008") then well_visit = 1;
+        if substr(diag{i},1,5) in ("Z0100","Z0101") then well_visit = 1;
+        if substr(diag{i},1,5) in ("Z0110","Z0111") then well_visit = 1;
+        if substr(diag{i},1,4) = "Z012" then well_visit = 1;
+        if substr(diag{i},1,4) = "Z013" then well_visit = 1;
+        if substr(diag{i},1,4) = "Z014" then well_visit = 1;
+
+    end;
+
+    drop i;
+run;
+
+proc print data = merged_county_final (OBS=50);
+run;
+
+PROC FREQ DATA=merged_county_final;
+    TABLES preventive well_visit / MISSING;
+RUN;
+
+data merged_county_final;
+    set merged_county_final;
+    where match_status = "Matched";
+run;
+
+/* ---- Beneficiary-level rollup -- any preventive AND any well_visit encounter, plus size_of_plan/cat ---- */
+proc sql;
+    create table bene_preventive_plan as
+    select bene_id_18900,
+           max(preventive) as any_preventive,
+           max(well_visit) as any_well_visit,
+           max(size_of_plan) as size_of_plan,
+           max(cat) as cat
+    from merged_county_final
+    group by bene_id_18900;
+quit;
+
+/* ================= PREVENTIVE TABLES (unchanged) ================= */
+
+proc sql;
+    create table summary_by_size as
+    select size_of_plan,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_preventive) as N_Preventive,
+           round(100 * calculated N_Preventive / calculated N_Total, 0.1) as Pct_Preventive
+    from bene_preventive_plan
+    group by size_of_plan;
+quit;
+
+proc print data=summary_by_size noobs label;
+    label size_of_plan  = "Plan Size"
+          N_Total       = "N Unique Individuals"
+          N_Preventive  = "N with Preventive Service"
+          Pct_Preventive = "% with Preventive Service";
+run;
+
+proc sql;
+    create table summary_by_cat as
+    select cat,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_preventive) as N_Preventive,
+           round(100 * calculated N_Preventive / calculated N_Total, 0.1) as Pct_Preventive
+    from bene_preventive_plan
+    group by cat;
+quit;
+
+proc print data=summary_by_cat noobs label;
+    label cat           = "Category"
+          N_Total       = "N Unique Individuals"
+          N_Preventive  = "N with Preventive Service"
+          Pct_Preventive = "% with Preventive Service";
+run;
+
+proc sql;
+    create table summary_by_size_cat as
+    select size_of_plan, cat,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_preventive) as N_Preventive,
+           round(100 * calculated N_Preventive / calculated N_Total, 0.1) as Pct_Preventive
+    from bene_preventive_plan
+    group by size_of_plan, cat;
+quit;
+
+proc print data=summary_by_size_cat noobs label;
+    label size_of_plan  = "Plan Size"
+          cat           = "Category"
+          N_Total       = "N Unique Individuals"
+          N_Preventive  = "N with Preventive Service"
+          Pct_Preventive = "% with Preventive Service";
+run;
+
+/* ================= WELL_VISIT TABLES (new) ================= */
+
+proc sql;
+    create table summary_wv_by_size as
+    select size_of_plan,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_well_visit) as N_Well_Visit,
+           round(100 * calculated N_Well_Visit / calculated N_Total, 0.1) as Pct_Well_Visit
+    from bene_preventive_plan
+    group by size_of_plan;
+quit;
+
+proc print data=summary_wv_by_size noobs label;
+    label size_of_plan   = "Plan Size"
+          N_Total        = "N Unique Individuals"
+          N_Well_Visit   = "N with Well Visit"
+          Pct_Well_Visit = "% with Well Visit";
+run;
+
+proc sql;
+    create table summary_wv_by_cat as
+    select cat,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_well_visit) as N_Well_Visit,
+           round(100 * calculated N_Well_Visit / calculated N_Total, 0.1) as Pct_Well_Visit
+    from bene_preventive_plan
+    group by cat;
+quit;
+
+proc print data=summary_wv_by_cat noobs label;
+    label cat            = "Category"
+          N_Total        = "N Unique Individuals"
+          N_Well_Visit   = "N with Well Visit"
+          Pct_Well_Visit = "% with Well Visit";
+run;
+
+proc sql;
+    create table summary_wv_by_size_cat as
+    select size_of_plan, cat,
+           count(distinct bene_id_18900) as N_Total,
+           sum(any_well_visit) as N_Well_Visit,
+           round(100 * calculated N_Well_Visit / calculated N_Total, 0.1) as Pct_Well_Visit
+    from bene_preventive_plan
+    group by size_of_plan, cat;
+quit;
+
+proc print data=summary_wv_by_size_cat noobs label;
+    label size_of_plan   = "Plan Size"
+          cat            = "Category"
+          N_Total        = "N Unique Individuals"
+          N_Well_Visit   = "N with Well Visit"
+          Pct_Well_Visit = "% with Well Visit";
+run;
