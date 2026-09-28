@@ -1,0 +1,383 @@
+/* ---- Clear WORK before starting fresh ---- */
+proc datasets library=work kill nolist;
+quit;
+
+/* ===== PART 1 - Merge MBSF FIPS onto claims ===== */
+
+/* ---- Step 1a: get the eligible '01'-sample population ---- */
+data mbsf_01;
+    set claims.Hk100ann_bid_2022 
+        (keep=bene_id_18900 hkst_cnty_01-hkst_cnty_12 hkpct5or20
+              hkage hkrace hksex hkdualmo hkorgen hkcuren hkrdsmo 
+              hkc_alz_yr_v2 hkc_nonalzh_demen_yr_v2 hkstat hkc_diab_yr_v2);
+    where hkpct5or20 = '01';
+    drop hkpct5or20;
+run;
+
+/* ---- Step 1b: draw a random sample of 200,000 beneficiaries ---- */
+proc surveyselect data=mbsf_01
+    out=mbsf_sampled
+    method=srs
+    n=200000
+    seed=20240001
+    noprint;
+run;
+
+proc sort data=mbsf_sampled
+           out=mbsf_dedup
+           nodupkey;
+    by bene_id_18900;
+run;
+
+data bene_fips_long;
+  SET mbsf_dedup;
+  month_num = 1;  fips_code = hkst_cnty_01;  OUTPUT;
+  month_num = 2;  fips_code = hkst_cnty_02;  OUTPUT;
+  month_num = 3;  fips_code = hkst_cnty_03;  OUTPUT;
+  month_num = 4;  fips_code = hkst_cnty_04;  OUTPUT;
+  month_num = 5;  fips_code = hkst_cnty_05;  OUTPUT;
+  month_num = 6;  fips_code = hkst_cnty_06;  OUTPUT;
+  month_num = 7;  fips_code = hkst_cnty_07;  OUTPUT;
+  month_num = 8;  fips_code = hkst_cnty_08;  OUTPUT;
+  month_num = 9;  fips_code = hkst_cnty_09;  OUTPUT;
+  month_num = 10; fips_code = hkst_cnty_10;  OUTPUT;
+  month_num = 11; fips_code = hkst_cnty_11;  OUTPUT;
+  month_num = 12; fips_code = hkst_cnty_12;  OUTPUT;
+  KEEP bene_id_18900 month_num fips_code;
+RUN;
+
+/* ---- Step 2 (REVISED): hash-filter claims to 200k sample; shift hbdiag0-4 to hbdiag1-5 via temp names ---- */
+data claims_extract;
+    if _n_ = 0 then set mbsf_sampled (keep=bene_id_18900);
+
+    if _n_ = 1 then do;
+        declare hash hb(dataset:"mbsf_sampled(keep=bene_id_18900)");
+        hb.defineKey("bene_id_18900");
+        hb.defineDone();
+    end;
+
+    SET claims.Hballenc_updated_2022
+        (KEEP=bene_id_18900 hbfrom hbthru hbcontr hbstate hbclmid hbdiag0-hbdiag4);
+
+    if hb.check() ne 0 then delete;   /* drop anyone not in the 200k sample */
+
+    /* shift hbdiag0-hbdiag4 into distinct temp names to avoid rename collision,
+       since hbdiag1-hbdiag4 already exist as separate variables on the source file */
+    length dxtmp1-dxtmp5 $7;   /* CONFIRM actual hbdiag length via PROC CONTENTS and adjust if needed */
+    array diag_orig{0:4} hbdiag0-hbdiag4;
+    array diag_temp{5} $7 dxtmp1-dxtmp5;
+    do _i = 1 to 5;
+        diag_temp{_i} = diag_orig{_i-1};
+    end;
+    drop hbdiag0-hbdiag4 _i;
+    rename dxtmp1=hbdiag1 dxtmp2=hbdiag2 dxtmp3=hbdiag3 dxtmp4=hbdiag4 dxtmp5=hbdiag5;
+
+    month_num = MONTH(hbfrom);
+    IF hbstate IN ('01','02','03','04','05','06','08','09','10',
+                   '11','12','13','14','15','16','17','18',
+                   '19','20','21','22','23','24','25','26',
+                   '27','28','29','30','31','32','33','34','35',
+                   '36','37','38','39','41','42','44','45',
+                   '46','47','49','50','51','53');
+RUN;
+
+/* ---- Step 3 - Sort both by the join keys ---- */
+PROC SORT DATA=claims_extract;
+  BY bene_id_18900 month_num;
+RUN;
+
+PROC SORT DATA=bene_fips_long;
+  BY bene_id_18900 month_num;
+RUN;
+
+/* ---- Step 4 - Merge MBSF FIPS onto claims ---- */
+DATA claims_with_fips;
+  MERGE claims_extract (IN=in_claims)
+        bene_fips_long  (IN=in_bene);
+  BY bene_id_18900 month_num;
+  IF in_claims;
+  IF in_claims AND in_bene           THEN match_status = "Matched";
+  ELSE IF in_claims AND NOT in_bene  THEN match_status = "Master Only";
+RUN;
+
+/* ---- Step 5 - Check match rate ---- */
+PROC FREQ DATA=claims_with_fips;
+  TABLES match_status / MISSING;
+RUN;
+
+
+/* ===== PART 2 - Merge county-level using data onto claims_with_fips ===== */
+
+PROC IMPORT OUT=using_county
+  DATAFILE="P:\cahpr\jkiel1\Plans Project\Transfer_2022.dta"
+  DBMS=DTA REPLACE;
+RUN;
+
+DATA claims_with_fips;
+  SET claims_with_fips;
+  LENGTH fips_clean $ 5  contract_clean $ 12;
+  fips_clean     = STRIP(fips_code);
+  contract_clean = STRIP(hbcontr);
+RUN;
+
+DATA using_county;
+  SET using_county;
+  LENGTH fips_clean $ 5  contract_clean $ 12;
+  fips_clean     = PUT(fipscode, Z5.);
+  contract_clean = STRIP(contractid);
+RUN;
+
+PROC PRINT DATA=using_county (OBS=20);
+  VAR fipscode contractid fips_clean contract_clean;
+RUN;
+
+PROC SQL;
+  SELECT COUNT(*) AS n_rows,
+         COUNT(DISTINCT CATX("-", fips_clean, contract_clean)) AS n_unique_combos
+  FROM using_county;
+QUIT;
+
+PROC SORT DATA=claims_with_fips;
+  BY fips_clean contract_clean;
+RUN;
+
+PROC SORT DATA=using_county;
+  BY fips_clean contract_clean;
+RUN;
+
+DATA merged_county;
+  MERGE claims_with_fips (IN=in_master)
+        using_county     (IN=in_using);
+  BY fips_clean contract_clean;
+  IF in_master AND in_using          THEN match_status = "Matched";
+  ELSE IF in_master AND NOT in_using THEN match_status = "Master Only";
+  ELSE IF NOT in_master AND in_using THEN match_status = "Using Only";
+RUN;
+
+PROC FREQ DATA=merged_county;
+  TABLES match_status / MISSING;
+RUN;
+
+PROC SQL;
+  SELECT
+    COUNT(*)                                                      AS n_total_rows,
+    SUM(CASE WHEN match_status = "Matched" THEN 1 ELSE 0 END)     AS n_matched,
+    SUM(CASE WHEN match_status = "Master Only" THEN 1 ELSE 0 END) AS n_master_only,
+    SUM(CASE WHEN match_status = "Using Only" THEN 1 ELSE 0 END)  AS n_using_only,
+    SUM(CASE WHEN match_status = "Matched" THEN 1 ELSE 0 END) /
+    COUNT(*) * 100                                                AS pct_matched_of_total
+  FROM merged_county;
+QUIT;
+
+PROC SQL;
+  SELECT
+    COUNT(*)                                                      AS n_master_rows,
+    SUM(CASE WHEN match_status = "Matched" THEN 1 ELSE 0 END)     AS n_master_matched,
+    SUM(CASE WHEN match_status = "Matched" THEN 1 ELSE 0 END) /
+    COUNT(*) * 100                                                AS pct_master_matched
+  FROM merged_county
+  WHERE match_status IN ("Matched", "Master Only");
+QUIT;
+
+PROC SQL;
+  SELECT
+    COUNT(DISTINCT CATX("-", fips_clean, contract_clean)) AS n_using_combos,
+    SUM(CASE WHEN matched_flag = 1 THEN 1 ELSE 0 END)     AS n_using_matched,
+    SUM(CASE WHEN matched_flag = 1 THEN 1 ELSE 0 END) /
+    COUNT(DISTINCT CATX("-", fips_clean, contract_clean)) * 100 AS pct_using_matched
+  FROM (
+    SELECT fips_clean, contract_clean,
+           MAX(CASE WHEN match_status = "Matched" THEN 1 ELSE 0 END) AS matched_flag
+    FROM merged_county
+    GROUP BY fips_clean, contract_clean
+  );
+QUIT;
+
+
+/* ============================================================
+   COUNTY-LEVEL SUMMARY (unique fips_clean)
+   ============================================================ */
+
+PROC SQL;
+  CREATE TABLE fips_flags AS
+  SELECT
+    fips_clean,
+    MAX(local)        AS local,
+    MAX(smregional)   AS smregional,
+    MAX(lgregional)   AS lgregional,
+    MAX(national)     AS national,
+    MAX(metropolitan) AS metropolitan,
+    MAX(micropolitan) AS micropolitan,
+    MAX(rural)        AS rural
+  FROM merged_county
+  GROUP BY fips_clean;
+QUIT;
+
+PROC SQL;
+  SELECT
+    COUNT(DISTINCT fips_clean)                    AS n_total_fips,
+    SUM(local)                                    AS n_local,
+    CALCULATED n_local / CALCULATED n_total_fips * 100 AS pct_local,
+    SUM(smregional)                               AS n_smregional,
+    CALCULATED n_smregional / CALCULATED n_total_fips * 100 AS pct_smregional,
+    SUM(lgregional)                               AS n_lgregional,
+    CALCULATED n_lgregional / CALCULATED n_total_fips * 100 AS pct_lgregional,
+    SUM(national)                                 AS n_national,
+    CALCULATED n_national / CALCULATED n_total_fips * 100 AS pct_national,
+    SUM(metropolitan)                             AS n_metropolitan,
+    CALCULATED n_metropolitan / CALCULATED n_total_fips * 100 AS pct_metropolitan,
+    SUM(micropolitan)                             AS n_micropolitan,
+    CALCULATED n_micropolitan / CALCULATED n_total_fips * 100 AS pct_micropolitan,
+    SUM(rural)                                    AS n_rural,
+    CALCULATED n_rural / CALCULATED n_total_fips * 100 AS pct_rural
+  FROM fips_flags;
+QUIT;
+
+
+/* ============================================================
+   BENEFICIARY-LEVEL SUMMARY (unique bene_id_18900)
+   ============================================================ */
+
+PROC SQL;
+  CREATE TABLE bene_flags AS
+  SELECT
+    bene_id_18900,
+    MAX(local)        AS local,
+    MAX(smregional)   AS smregional,
+    MAX(lgregional)   AS lgregional,
+    MAX(national)     AS national,
+    MAX(metropolitan) AS metropolitan,
+    MAX(micropolitan) AS micropolitan,
+    MAX(rural)        AS rural
+  FROM merged_county
+  GROUP BY bene_id_18900;
+QUIT;
+
+PROC SQL;
+  SELECT
+    COUNT(DISTINCT bene_id_18900)                 AS n_total_benes,
+    SUM(local)                                    AS n_local,
+    CALCULATED n_local / CALCULATED n_total_benes * 100 AS pct_local,
+    SUM(smregional)                               AS n_smregional,
+    CALCULATED n_smregional / CALCULATED n_total_benes * 100 AS pct_smregional,
+    SUM(lgregional)                               AS n_lgregional,
+    CALCULATED n_lgregional / CALCULATED n_total_benes * 100 AS pct_lgregional,
+    SUM(national)                                 AS n_national,
+    CALCULATED n_national / CALCULATED n_total_benes * 100 AS pct_national,
+    SUM(metropolitan)                             AS n_metropolitan,
+    CALCULATED n_metropolitan / CALCULATED n_total_benes * 100 AS pct_metropolitan,
+    SUM(micropolitan)                             AS n_micropolitan,
+    CALCULATED n_micropolitan / CALCULATED n_total_benes * 100 AS pct_micropolitan,
+    SUM(rural)                                    AS n_rural,
+    CALCULATED n_rural / CALCULATED n_total_benes * 100 AS pct_rural
+  FROM bene_flags;
+QUIT;
+
+/* ---- Clear intermediate datasets no longer needed ---- */
+proc datasets library=work nolist;
+    delete bene_fips_long mbsf_dedup mbsf_01 fips_flags bene_flags;
+quit;
+
+
+/* ============================================================
+   PART 3 - Bring hbrchcp (first 5 claim lines per claim) and MBSF
+            demographic/clinical variables onto merged_county
+   Source: claims.Hballenl_updated_2022 (traditional Medicare claim line data)
+   ============================================================ */
+
+/* ---- Step 0: get the list of bene-claim combos actually needed, from merged_county ---- */
+proc sort data=merged_county (keep=bene_id_18900 hbclmid)
+           out=needed_claims
+           nodupkey;
+    by bene_id_18900 hbclmid;
+run;
+
+/* ---- Step 1 (REVISED): hash-filter, first 5 lines only, pulling hbrcmd1-4 alongside hbrchcp ---- */
+data hbrchcp_first5;
+    if _n_ = 0 then set needed_claims;
+
+    if _n_ = 1 then do;
+        declare hash h(dataset:"needed_claims");
+        h.defineKey("bene_id_18900", "hbclmid");
+        h.defineDone();
+    end;
+
+    set claims.Hballenl_updated_2022 (keep=bene_id_18900 hbclmid hbrchcp hbrcmd1-hbrcmd4 hbrevind);
+
+    where hbrevind <= 5;
+
+    if h.check() = 0 then output;
+run;
+
+/* ---- Step 1b: collapse to one row per bene_id_18900+hbclmid, flag if ANY of the first 5 lines had modifier "33" ---- */
+proc sql;
+    create table prev_proc_modifier_flag as
+    select bene_id_18900, hbclmid,
+           max(hbrcmd1="33" or hbrcmd2="33" or hbrcmd3="33" or hbrcmd4="33") as prev_proc_modifier
+    from hbrchcp_first5
+    group by bene_id_18900, hbclmid;
+quit;
+
+/* ---- Step 2: sort by claim + line number (unchanged) ---- */
+proc sort data=hbrchcp_first5;
+    by bene_id_18900 hbclmid hbrevind;
+run;
+
+/* ---- Step 3: transpose directly using hbrevind as the column position (unchanged) ---- */
+proc transpose data=hbrchcp_first5
+                out=hbrchcp_wide (drop=_name_)
+                prefix=hbrchcp;
+    by bene_id_18900 hbclmid;
+    id hbrevind;
+    var hbrchcp;
+run;
+
+/* ---- Step 4: hash-based merge -- hbrchcp (claim-level) + prev_proc_modifier + MBSF vars (bene-level) ---- */
+data merged_county_final (compress=yes);
+    if _n_ = 0 then set hbrchcp_wide;
+    if _n_ = 0 then set prev_proc_modifier_flag (keep=bene_id_18900 hbclmid prev_proc_modifier);
+    if _n_ = 0 then set mbsf_sampled (keep=bene_id_18900 hkage hkrace hksex hkdualmo hkorgen 
+                                            hkcuren hkrdsmo hkc_alz_yr_v2 
+                                            hkc_nonalzh_demen_yr_v2 hkc_diab_yr_v2 hkstat);
+
+    if _n_ = 1 then do;
+        declare hash hw(dataset:"hbrchcp_wide");
+        hw.defineKey("bene_id_18900", "hbclmid");
+        hw.defineData(all: "yes");
+        hw.defineDone();
+
+        declare hash hp(dataset:"prev_proc_modifier_flag");
+        hp.defineKey("bene_id_18900", "hbclmid");
+        hp.defineData(all: "yes");
+        hp.defineDone();
+
+        declare hash hm(dataset:"mbsf_sampled(keep=bene_id_18900 hkage hkrace hksex hkdualmo hkorgen hkcuren hkrdsmo hkc_alz_yr_v2 hkc_nonalzh_demen_yr_v2 hkc_diab_yr_v2 hkstat)");
+        hm.defineKey("bene_id_18900");
+        hm.defineData(all: "yes");
+        hm.defineDone();
+    end;
+
+    set merged_county;
+
+    call missing(of hbrchcp1-hbrchcp5);
+    rc1 = hw.find();
+
+    call missing(prev_proc_modifier);
+    rc2 = hp.find();
+    if rc2 ne 0 then prev_proc_modifier = 0;   /* no line-level data found for this claim -- default to 0 */
+
+    call missing(hkage, hkrace, hksex, hkdualmo, hkorgen, hkcuren, hkrdsmo, 
+                  hkc_alz_yr_v2, hkc_nonalzh_demen_yr_v2, hkc_diab_yr_v2, hkstat);
+    rc3 = hm.find();
+
+    drop rc1 rc2 rc3;
+run;
+
+proc print data = merged_county_final (OBS=50);
+WHERE match_status = "Matched";
+run;
+
+data merged_county_final;
+    set merged_county_final;
+    where match_status = "Matched";
+run;
